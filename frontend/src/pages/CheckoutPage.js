@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
+import useRazorpay from "react-razorpay";
 
 import Navbar from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
@@ -17,11 +18,12 @@ import { CreditCard, Wallet, ShoppingCart } from "lucide-react";
 const CheckoutPage = () => {
   const navigate = useNavigate();
   const { user, loadRetailerStats } = useAuth();
+  const [Razorpay] = useRazorpay();
 
   const [cartItems, setCartItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [deliveryAddress, setDeliveryAddress] = useState(user?.address || "");
-  const [paymentMethod, setPaymentMethod] = useState("online");
+  const [paymentMethod, setPaymentMethod] = useState("razorpay");
   const [backendStatus, setBackendStatus] = useState("checking");
 
   useEffect(() => {
@@ -113,7 +115,7 @@ const CheckoutPage = () => {
     );
 
   // ------------------------------------------------
-  //   PLACE ORDER + REALTIME RETAILER UPDATE
+  //   RAZORPAY PAYMENT HANDLER
   // ------------------------------------------------
   const handlePlaceOrder = async (e) => {
     e.preventDefault();
@@ -131,39 +133,135 @@ const CheckoutPage = () => {
     setLoading(true);
 
     try {
-      const payload = {
-        items: cartItems.map((it) => ({
-          product_id: it.product.id,
-          quantity: it.quantity,
-        })),
-        delivery_address: deliveryAddress,
-        payment_method: paymentMethod,
-      };
+      const total = calculateTotal();
+      const items = cartItems.map((it) => ({
+        product_id: it.product.id,
+        quantity: it.quantity,
+      }));
 
-      console.log("🎯 Placing order with payload:", payload);
+      // If payment method is COD, create order directly
+      if (paymentMethod === "cod") {
+        const payload = {
+          items,
+          delivery_address: deliveryAddress,
+          payment_method: "cod",
+        };
 
-      const response = await ordersAPI.create(user.id, payload);
+        console.log("🎯 Placing COD order with payload:", payload);
+        const response = await ordersAPI.create(user.id, payload);
+        console.log("✅ Order created:", response.data);
 
-      console.log("✅ Order created:", response.data);
+        // Update seller stats
+        const sellerIds = [
+          ...new Set(cartItems.map((it) => it.product.seller_id).filter(id => id && id !== "unknown")),
+        ];
+        sellerIds.forEach((sid) => {
+          if (loadRetailerStats) {
+            loadRetailerStats(sid);
+          }
+        });
 
-      // ⭐ Extract all seller IDs involved in this order
-      const sellerIds = [
-        ...new Set(cartItems.map((it) => it.product.seller_id).filter(id => id && id !== "unknown")),
-      ];
+        toast.success("Order placed successfully!");
+        navigate(`/order/${response.data.id}`);
+        return;
+      }
 
-      console.log("🏪 Affected sellers:", sellerIds);
+      // Razorpay payment flow
+      console.log("🎯 Creating Razorpay order for amount:", total);
 
-      // ⭐ Update each retailer panel instantly
-      sellerIds.forEach((sid) => {
-        if (loadRetailerStats) {
-          loadRetailerStats(sid);
-        }
+      // Step 1: Create Razorpay order on backend
+      const orderResponse = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/payment/create-order`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: total,
+          currency: "INR",
+          user_id: user.id,
+          items,
+          delivery_address: deliveryAddress,
+        }),
       });
 
-      toast.success("Order placed successfully!");
+      if (!orderResponse.ok) {
+        throw new Error("Failed to create payment order");
+      }
 
-      // Navigate to order confirmation page
-      navigate(`/order/${response.data.id}`);
+      const orderData = await orderResponse.json();
+      console.log("✅ Razorpay order created:", orderData);
+
+      // Step 2: Open Razorpay checkout
+      const options = {
+        key: orderData.key_id,
+        amount: orderData.amount * 100, // Convert to paise
+        currency: orderData.currency,
+        name: "LiveMART",
+        description: "Order Payment",
+        order_id: orderData.order_id,
+        handler: async function (response) {
+          console.log("✅ Payment successful:", response);
+
+          try {
+            // Step 3: Verify payment on backend
+            const verifyResponse = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/payment/verify`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+                user_id: user.id,
+                items,
+                delivery_address: deliveryAddress,
+                total_amount: total,
+              }),
+            });
+
+            if (!verifyResponse.ok) {
+              throw new Error("Payment verification failed");
+            }
+
+            const verifyData = await verifyResponse.json();
+            console.log("✅ Payment verified:", verifyData);
+
+            // Update seller stats
+            const sellerIds = [
+              ...new Set(cartItems.map((it) => it.product.seller_id).filter(id => id && id !== "unknown")),
+            ];
+            sellerIds.forEach((sid) => {
+              if (loadRetailerStats) {
+                loadRetailerStats(sid);
+              }
+            });
+
+            toast.success("Payment successful! Order placed.");
+            navigate(`/order/${verifyData.order.id}`);
+          } catch (error) {
+            console.error("❌ Payment verification error:", error);
+            toast.error("Payment verification failed. Please contact support.");
+          } finally {
+            setLoading(false);
+          }
+        },
+        prefill: {
+          name: user.name,
+          email: user.email,
+          contact: user.phone,
+        },
+        theme: {
+          color: "#7C3AED",
+        },
+        modal: {
+          ondismiss: function() {
+            console.log("Payment cancelled");
+            toast.error("Payment cancelled");
+            setLoading(false);
+          }
+        }
+      };
+
+      const razorpayInstance = new Razorpay(options);
+      razorpayInstance.open();
+
     } catch (error) {
       console.error("❌ Order error:", {
         message: error.message,
@@ -182,7 +280,6 @@ const CheckoutPage = () => {
       }
 
       toast.error(errorMessage);
-    } finally {
       setLoading(false);
     }
   };
@@ -246,16 +343,16 @@ const CheckoutPage = () => {
                       onValueChange={setPaymentMethod}
                     >
                       <div className="flex items-center gap-2 mb-3">
-                        <RadioGroupItem value="online" id="online" />
-                        <Label htmlFor="online" className="cursor-pointer flex items-center">
+                        <RadioGroupItem value="razorpay" id="razorpay" />
+                        <Label htmlFor="razorpay" className="cursor-pointer flex items-center">
                           <CreditCard className="mr-2 h-4 w-4" />
-                          Online Payment (Mock)
+                          Pay Online (Razorpay)
                         </Label>
                       </div>
 
                       <div className="flex items-center gap-2">
-                        <RadioGroupItem value="offline" id="offline" />
-                        <Label htmlFor="offline" className="cursor-pointer flex items-center">
+                        <RadioGroupItem value="cod" id="cod" />
+                        <Label htmlFor="cod" className="cursor-pointer flex items-center">
                           <Wallet className="mr-2 h-4 w-4" />
                           Cash on Delivery
                         </Label>

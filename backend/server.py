@@ -26,6 +26,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import razorpay
+import hmac
+import hashlib
 
 # ================= CONFIG =====================
 ROOT_DIR = Path(__file__).parent
@@ -46,6 +49,11 @@ OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "5"))
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+# Razorpay Config
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID else None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
@@ -390,6 +398,13 @@ async def google_auth(data: GoogleAuthRequest):
             # Existing user - login
             user_doc.pop("password", None)
             
+            # Check if profile is complete
+            incomplete_profile = (
+                not user_doc.get("phone") or 
+                not user_doc.get("address") or 
+                user_doc.get("role") not in ["customer", "retailer", "wholesaler"]
+            )
+            
             # Check retailer matching for customers
             if user_doc.get("role") == "customer" and user_doc.get("pincode") and not user_doc.get("preferred_retailer_id"):
                 matching_retailer = await db.users.find_one({
@@ -404,14 +419,20 @@ async def google_auth(data: GoogleAuthRequest):
                     )
             
             user = User(**user_doc)
+            token = create_token({"sub": user.email, "user_id": user.id})
+            
+            if incomplete_profile:
+                return {"access_token": token, "user": user, "incomplete_profile": True}
+            
+            return Token(access_token=token, user=user)
         else:
-            # New user - register
+            # New user - register (incomplete profile)
             user_dict = {
                 "id": str(uuid.uuid4()),
                 "email": google_user["email"],
                 "name": google_user["name"],
-                "phone": "",  # Can be updated later
-                "role": "customer",  # Default role
+                "phone": "",
+                "role": "customer",
                 "address": "",
                 "pincode": None,
                 "preferred_retailer_id": None,
@@ -426,9 +447,9 @@ async def google_auth(data: GoogleAuthRequest):
             
             await db.users.insert_one(doc)
             logger.info(f"✅ New user registered via Google: {user.email}")
-        
-        token = create_token({"sub": user.email, "user_id": user.id})
-        return Token(access_token=token, user=user)
+            
+            token = create_token({"sub": user.email, "user_id": user.id})
+            return {"access_token": token, "user": user, "incomplete_profile": True}
         
     except HTTPException:
         raise
@@ -437,6 +458,46 @@ async def google_auth(data: GoogleAuthRequest):
         raise HTTPException(status_code=500, detail="Google authentication failed")
 
 # ================= USER/RETAILER ENDPOINTS ====================
+class UserProfileUpdate(BaseModel):
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    pincode: Optional[str] = None
+    role: Optional[str] = None
+
+@api.put("/users/{user_id}/profile")
+async def update_user_profile(user_id: str, data: UserProfileUpdate):
+    """Update user profile information"""
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(404, "User not found")
+    
+    update_data = {}
+    if data.phone is not None:
+        update_data["phone"] = data.phone
+    if data.address is not None:
+        update_data["address"] = data.address
+    if data.pincode is not None:
+        update_data["pincode"] = data.pincode
+    if data.role is not None and data.role in ["customer", "retailer", "wholesaler"]:
+        update_data["role"] = data.role
+    
+    # If customer with pincode, find matching retailer
+    if update_data.get("role") == "customer" or (user.get("role") == "customer" and data.pincode):
+        pincode = data.pincode or user.get("pincode")
+        if pincode:
+            matching_retailer = await db.users.find_one({
+                "role": "retailer",
+                "pincode": pincode
+            })
+            if matching_retailer:
+                update_data["preferred_retailer_id"] = matching_retailer["id"]
+                logger.info(f"Matched customer to retailer {matching_retailer['id']} by pincode {pincode}")
+    
+    await db.users.update_one({"id": user_id}, {"$set": update_data})
+    
+    updated_user = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
+    return updated_user
+
 @api.get("/retailers/by-pincode/{pincode}")
 async def get_retailers_by_pincode(pincode: str):
     """Get all retailers with matching pincode"""
@@ -853,6 +914,146 @@ async def clear_cart(uid: str):
     
     await db.cart.delete_one({"user_id": uid})
     return {"message": "Cart cleared"}
+
+# ================= RAZORPAY PAYMENT ==================
+class RazorpayOrderRequest(BaseModel):
+    amount: float
+    currency: str = "INR"
+    user_id: str
+    items: List[dict]
+    delivery_address: str
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+    user_id: str
+    items: List[dict]
+    delivery_address: str
+    total_amount: float
+
+@api.post("/payment/create-order")
+async def create_razorpay_order(payload: RazorpayOrderRequest):
+    """Create a Razorpay order for payment"""
+    try:
+        if not razorpay_client:
+            raise HTTPException(500, "Razorpay not configured")
+        
+        # Convert amount to paise (smallest currency unit)
+        amount_in_paise = int(payload.amount * 100)
+        
+        # Create Razorpay order
+        razorpay_order = razorpay_client.order.create({
+            "amount": amount_in_paise,
+            "currency": payload.currency,
+            "payment_capture": 1  # Auto capture payment
+        })
+        
+        logger.info(f"✅ Razorpay order created: {razorpay_order['id']}")
+        
+        return {
+            "order_id": razorpay_order["id"],
+            "amount": payload.amount,
+            "currency": payload.currency,
+            "key_id": RAZORPAY_KEY_ID
+        }
+    except Exception as e:
+        logger.error(f"❌ Razorpay order creation failed: {e}")
+        raise HTTPException(500, f"Payment order creation failed: {str(e)}")
+
+@api.post("/payment/verify")
+async def verify_razorpay_payment(payload: RazorpayVerifyRequest):
+    """Verify Razorpay payment signature and create order"""
+    try:
+        if not razorpay_client:
+            raise HTTPException(500, "Razorpay not configured")
+        
+        # Verify signature
+        generated_signature = hmac.new(
+            RAZORPAY_KEY_SECRET.encode(),
+            f"{payload.razorpay_order_id}|{payload.razorpay_payment_id}".encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if generated_signature != payload.razorpay_signature:
+            raise HTTPException(400, "Invalid payment signature")
+        
+        logger.info(f"✅ Payment verified: {payload.razorpay_payment_id}")
+        
+        # Validate user exists
+        user = await db.users.find_one({"id": payload.user_id})
+        if not user:
+            raise HTTPException(404, f"User not found: {payload.user_id}")
+        
+        # Check stock and build order items
+        order_items = []
+        total = 0.0
+        
+        for it in payload.items:
+            pid = it["product_id"]
+            qty = safe_int(it["quantity"])
+            product = await db.products.find_one({"id": pid})
+            
+            if not product:
+                raise HTTPException(404, f"Product not found: {pid}")
+            
+            if product["stock"] < qty:
+                raise HTTPException(400, f"Insufficient stock for {product['name']}")
+            
+            subtotal = product["price"] * qty
+            total += subtotal
+            
+            order_items.append({
+                "product_id": pid,
+                "product_name": product["name"],
+                "quantity": qty,
+                "price": product["price"],
+                "total": subtotal,
+                "seller_id": product["seller_id"]
+            })
+        
+        # Create order
+        order = {
+            "id": str(uuid.uuid4()),
+            "user_id": payload.user_id,
+            "items": order_items,
+            "total_amount": total,
+            "delivery_address": payload.delivery_address,
+            "payment_method": "razorpay",
+            "payment_status": "paid",
+            "payment_id": payload.razorpay_payment_id,
+            "razorpay_order_id": payload.razorpay_order_id,
+            "order_status": "placed",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        # Save order
+        await db.orders.insert_one(order)
+        
+        # Reduce stock
+        for it in payload.items:
+            await db.products.update_one(
+                {"id": it["product_id"]}, 
+                {"$inc": {"stock": -safe_int(it["quantity"])}}
+            )
+        
+        # Clear cart
+        await db.cart.delete_one({"user_id": payload.user_id})
+        
+        order.pop('_id', None)
+        logger.info(f"✅ Order created after payment: {order['id']}")
+        
+        return {
+            "success": True,
+            "order": order,
+            "message": "Payment verified and order placed successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Payment verification failed: {e}")
+        raise HTTPException(500, f"Payment verification failed: {str(e)}")
 
 # ================= ORDERS ===========================
 @api.post("/orders/{uid}")

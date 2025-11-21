@@ -176,10 +176,12 @@ The frontend will run on `http://localhost:3000`
 ### Login Options
 
 #### Password Login
+
 - Enter your email and password
 - Click "Login"
 
 #### OTP Login
+
 1. Click "Login with OTP" button
 2. Enter your email
 3. Click "Send OTP"
@@ -187,6 +189,7 @@ The frontend will run on `http://localhost:3000`
 5. Enter the OTP and click "Verify OTP"
 
 #### Google OAuth
+
 - Click "Sign in with Google" button
 - Select your Google account
 - Authorize the application
@@ -248,16 +251,19 @@ OOPS-MAIN/
 ### Backend Issues
 
 **MongoDB Connection Error**
+
 - Verify your connection string in backend/.env
 - Check if your IP is whitelisted in MongoDB Atlas
 - Ensure database user credentials are correct
 
 **OTP Email Not Sending**
+
 - Verify SMTP credentials in backend/.env
 - Check if 2-Step Verification is enabled on Gmail
 - Ensure you're using an App Password, not your regular password
 
 **Google OAuth Error**
+
 - Verify Client ID and Secret are correct
 - Check Authorized JavaScript origins in Google Console
 - Wait 2-3 minutes for changes to propagate
@@ -265,17 +271,20 @@ OOPS-MAIN/
 ### Frontend Issues
 
 **Cannot Connect to Backend**
+
 - Ensure backend server is running on port 8000
 - Check REACT_APP_BACKEND_URL in frontend/.env
 - Verify CORS settings in backend/.env
 
 **Google Sign-in Button Not Visible**
+
 - Check if REACT_APP_GOOGLE_CLIENT_ID is set correctly
 - Ensure the Client ID is valid (not placeholder text)
 
 ## Technologies Used
 
 ### Backend
+
 - FastAPI - Web framework
 - Motor - Async MongoDB driver
 - PyJWT - JSON Web Token authentication
@@ -285,6 +294,7 @@ OOPS-MAIN/
 - aiosmtplib - Async email sending
 
 ### Frontend
+
 - React - UI framework
 - React Router - Navigation
 - Axios - HTTP client

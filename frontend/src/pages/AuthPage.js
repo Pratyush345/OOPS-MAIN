@@ -7,14 +7,17 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { authAPI } from "@/api/api";
 import { toast } from "sonner";
 import { motion } from "framer-motion";
 import { Store, ArrowLeft, Mail, Lock, Phone, Home, Shield } from "lucide-react";
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
+import axios from "axios";
 
 const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID || "";
 const GOOGLE_OAUTH_ENABLED = GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID !== "your-google-client-id.apps.googleusercontent.com" && GOOGLE_CLIENT_ID.includes(".apps.googleusercontent.com");
+const API_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 
 export default function AuthPage() {
   const navigate = useNavigate();
@@ -37,6 +40,17 @@ export default function AuthPage() {
   const [otpEmail, setOtpEmail] = useState("");
   const [otp, setOtp] = useState("");
   const [otpSent, setOtpSent] = useState(false);
+
+  // Profile Completion Modal States
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [incompleteUser, setIncompleteUser] = useState(null);
+  const [incompleteToken, setIncompleteToken] = useState(null);
+  const [profileData, setProfileData] = useState({
+    phone: "",
+    address: "",
+    pincode: "",
+    role: "customer",
+  });
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -121,15 +135,73 @@ export default function AuthPage() {
     setLoading(true);
     try {
       const response = await authAPI.googleAuth(credentialResponse.credential);
-      const { access_token, user } = response.data;
-      login(user, access_token);
-      toast.success("Google login successful!");
+      const { access_token, user, incomplete_profile } = response.data;
+      
+      if (incomplete_profile) {
+        // Show profile completion modal
+        setIncompleteUser(user);
+        setIncompleteToken(access_token);
+        setProfileData({
+          phone: user.phone || "",
+          address: user.address || "",
+          pincode: user.pincode || "",
+          role: user.role || "customer",
+        });
+        setShowProfileModal(true);
+        toast.info("Please complete your profile");
+      } else {
+        // Profile complete, proceed to login
+        login(user, access_token);
+        toast.success("Google login successful!");
 
-      if (user.role === "customer") navigate("/customer/dashboard");
-      else if (user.role === "retailer") navigate("/retailer/dashboard");
-      else if (user.role === "wholesaler") navigate("/wholesaler/dashboard");
+        if (user.role === "customer") navigate("/customer/dashboard");
+        else if (user.role === "retailer") navigate("/retailer/dashboard");
+        else if (user.role === "wholesaler") navigate("/wholesaler/dashboard");
+      }
     } catch (error) {
       toast.error(error.response?.data?.detail || "Google login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleProfileComplete = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    
+    try {
+      // Validate fields
+      if (!profileData.phone || !profileData.address || !profileData.role) {
+        toast.error("Please fill all required fields");
+        setLoading(false);
+        return;
+      }
+
+      // Update user profile
+      await axios.put(
+        `${API_URL}/api/users/${incompleteUser.id}/profile`,
+        profileData
+      );
+
+      // Fetch updated user data
+      const response = await axios.get(
+        `${API_URL}/api/users/${incompleteUser.id}/profile`,
+        { headers: { Authorization: `Bearer ${incompleteToken}` } }
+      );
+
+      const updatedUser = response.data || { ...incompleteUser, ...profileData };
+
+      // Login with updated profile
+      login(updatedUser, incompleteToken);
+      toast.success("Profile completed successfully!");
+      setShowProfileModal(false);
+
+      if (updatedUser.role === "customer") navigate("/customer/dashboard");
+      else if (updatedUser.role === "retailer") navigate("/retailer/dashboard");
+      else if (updatedUser.role === "wholesaler") navigate("/wholesaler/dashboard");
+    } catch (error) {
+      toast.error("Failed to update profile");
+      console.error(error);
     } finally {
       setLoading(false);
     }
@@ -444,6 +516,85 @@ export default function AuthPage() {
         OTP will be sent to your email (or logged in console for testing)
       </p>
     </motion.div>
+
+    {/* Profile Completion Modal */}
+    <Dialog open={showProfileModal} onOpenChange={setShowProfileModal}>
+      <DialogContent className="sm:max-w-[500px]">
+        <DialogHeader>
+          <DialogTitle>Complete Your Profile</DialogTitle>
+          <DialogDescription>
+            Please provide additional information to complete your registration
+          </DialogDescription>
+        </DialogHeader>
+        <form onSubmit={handleProfileComplete} className="space-y-4">
+          <div>
+            <Label htmlFor="profile-role">Account Type *</Label>
+            <Select
+              value={profileData.role}
+              onValueChange={(value) => setProfileData({ ...profileData, role: value })}
+            >
+              <SelectTrigger id="profile-role">
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="customer">Customer</SelectItem>
+                <SelectItem value="retailer">Retailer</SelectItem>
+                <SelectItem value="wholesaler">Wholesaler</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div>
+            <Label htmlFor="profile-phone">Phone Number *</Label>
+            <div className="relative">
+              <Phone className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <Input
+                id="profile-phone"
+                type="tel"
+                placeholder="Enter phone number"
+                value={profileData.phone}
+                onChange={(e) => setProfileData({ ...profileData, phone: e.target.value })}
+                className="pl-10"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor="profile-address">Address *</Label>
+            <div className="relative">
+              <Home className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <Input
+                id="profile-address"
+                type="text"
+                placeholder="Enter address"
+                value={profileData.address}
+                onChange={(e) => setProfileData({ ...profileData, address: e.target.value })}
+                className="pl-10"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor="profile-pincode">
+              Pincode {profileData.role === "customer" && "(for retailer matching)"}
+            </Label>
+            <Input
+              id="profile-pincode"
+              type="text"
+              placeholder="Enter pincode"
+              value={profileData.pincode}
+              onChange={(e) => setProfileData({ ...profileData, pincode: e.target.value })}
+            />
+          </div>
+
+          <Button type="submit" className="w-full" disabled={loading}>
+            {loading ? "Completing Profile..." : "Complete Profile"}
+          </Button>
+        </form>
+      </DialogContent>
+    </Dialog>
   </div>
   );
 
