@@ -69,6 +69,13 @@ export const healthAPI = {
 export const authAPI = {
   register: (data) => api.post(`/auth/register`, data),
   login: (data) => api.post(`/auth/login`, data),
+  
+  // OTP endpoints
+  sendOTP: (data) => api.post(`/auth/otp/send`, data),
+  verifyOTP: (data) => api.post(`/auth/otp/verify`, data),
+  
+  // Google OAuth
+  googleAuth: (token) => api.post(`/auth/google`, { token }),
 };
 
 // ======================================================

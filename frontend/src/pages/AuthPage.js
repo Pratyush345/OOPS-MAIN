@@ -10,7 +10,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { authAPI } from "@/api/api";
 import { toast } from "sonner";
 import { motion } from "framer-motion";
-import { Store, ArrowLeft, Mail, Lock, Phone, Home } from "lucide-react";
+import { Store, ArrowLeft, Mail, Lock, Phone, Home, Shield } from "lucide-react";
+import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
+
+const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID || "";
+const GOOGLE_OAUTH_ENABLED = GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID !== "your-google-client-id.apps.googleusercontent.com" && GOOGLE_CLIENT_ID.includes(".apps.googleusercontent.com");
 
 export default function AuthPage() {
   const navigate = useNavigate();
@@ -27,6 +31,12 @@ export default function AuthPage() {
     address: "",
     pincode: "",
   });
+
+  // OTP States
+  const [showOTPLogin, setShowOTPLogin] = useState(false);
+  const [otpEmail, setOtpEmail] = useState("");
+  const [otp, setOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -66,7 +76,70 @@ export default function AuthPage() {
     }
   };
 
-  return (
+  // OTP Handlers
+  const handleSendOTP = async () => {
+    if (!otpEmail) {
+      toast.error("Please enter your email");
+      return;
+    }
+    setLoading(true);
+    try {
+      await authAPI.sendOTP({ email: otpEmail, purpose: "login" });
+      setOtpSent(true);
+      toast.success("OTP sent to your email!");
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Failed to send OTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyOTP = async () => {
+    if (!otp) {
+      toast.error("Please enter the OTP");
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await authAPI.verifyOTP({ email: otpEmail, otp });
+      const { access_token, user } = response.data;
+      login(user, access_token);
+      toast.success("Login successful!");
+
+      if (user.role === "customer") navigate("/customer/dashboard");
+      else if (user.role === "retailer") navigate("/retailer/dashboard");
+      else if (user.role === "wholesaler") navigate("/wholesaler/dashboard");
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Invalid OTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Google OAuth Handler
+  const handleGoogleSuccess = async (credentialResponse) => {
+    setLoading(true);
+    try {
+      const response = await authAPI.googleAuth(credentialResponse.credential);
+      const { access_token, user } = response.data;
+      login(user, access_token);
+      toast.success("Google login successful!");
+
+      if (user.role === "customer") navigate("/customer/dashboard");
+      else if (user.role === "retailer") navigate("/retailer/dashboard");
+      else if (user.role === "wholesaler") navigate("/wholesaler/dashboard");
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Google login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogleError = () => {
+    toast.error("Google login failed");
+  };
+
+  const content = (
     <div className="relative min-h-screen flex items-center justify-center bg-black overflow-hidden p-6">
 
       {/* Neon floating blobs */}
@@ -111,36 +184,129 @@ export default function AuthPage() {
 
               {/* LOGIN */}
               <TabsContent value="login">
-                <form onSubmit={handleLogin} className="space-y-4">
+                {!showOTPLogin ? (
+                  <form onSubmit={handleLogin} className="space-y-4">
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-3 text-gray-400" />
+                      <Input
+                        className="pl-10 bg-white/10 border-white/20 text-white"
+                        type="email"
+                        placeholder="Email"
+                        value={loginData.email}
+                        onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
+                        required
+                      />
+                    </div>
 
-                  <div className="relative">
-                    <Mail className="absolute left-3 top-3 text-gray-400" />
-                    <Input
-                      className="pl-10 bg-white/10 border-white/20 text-white"
-                      type="email"
-                      placeholder="Email"
-                      value={loginData.email}
-                      onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
-                      required
-                    />
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-3 text-gray-400" />
+                      <Input
+                        className="pl-10 bg-white/10 border-white/20 text-white"
+                        type="password"
+                        placeholder="Password"
+                        value={loginData.password}
+                        onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
+                        required
+                      />
+                    </div>
+
+                    <Button type="submit" disabled={loading} className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5 shadow-lg shadow-purple-500/30">
+                      {loading ? "Logging in..." : "Login"}
+                    </Button>
+
+                    <div className="relative my-4">
+                      <div className="absolute inset-0 flex items-center">
+                        <span className="w-full border-t border-white/20" />
+                      </div>
+                      <div className="relative flex justify-center text-xs uppercase">
+                        <span className="bg-black px-2 text-gray-400">Or</span>
+                      </div>
+                    </div>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setShowOTPLogin(true)}
+                      className="w-full bg-white/5 border-white/20 text-white hover:bg-white/10 rounded-xl py-5"
+                    >
+                      <Shield className="mr-2 h-4 w-4" />
+                      Login with OTP
+                    </Button>
+
+                    {GOOGLE_OAUTH_ENABLED && (
+                      <div className="flex justify-center mt-4">
+                        <GoogleLogin
+                          onSuccess={handleGoogleSuccess}
+                          onError={handleGoogleError}
+                          theme="filled_black"
+                          size="large"
+                          text="signin_with"
+                          shape="rectangular"
+                        />
+                      </div>
+                    )}
+                  </form>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-3 text-gray-400" />
+                      <Input
+                        className="pl-10 bg-white/10 border-white/20 text-white"
+                        type="email"
+                        placeholder="Enter your email"
+                        value={otpEmail}
+                        onChange={(e) => setOtpEmail(e.target.value)}
+                        disabled={otpSent}
+                        required
+                      />
+                    </div>
+
+                    {!otpSent ? (
+                      <Button
+                        onClick={handleSendOTP}
+                        disabled={loading}
+                        className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5"
+                      >
+                        {loading ? "Sending..." : "Send OTP"}
+                      </Button>
+                    ) : (
+                      <>
+                        <div className="relative">
+                          <Input
+                            className="bg-white/10 border-white/20 text-white text-center text-2xl tracking-widest"
+                            type="text"
+                            placeholder="000000"
+                            maxLength="6"
+                            value={otp}
+                            onChange={(e) => setOtp(e.target.value.toUpperCase())}
+                            required
+                          />
+                        </div>
+                        <Button
+                          onClick={handleVerifyOTP}
+                          disabled={loading}
+                          className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5"
+                        >
+                          {loading ? "Verifying..." : "Verify OTP"}
+                        </Button>
+                      </>
+                    )}
+
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        setShowOTPLogin(false);
+                        setOtpSent(false);
+                        setOtp("");
+                        setOtpEmail("");
+                      }}
+                      className="w-full text-white hover:bg-white/10"
+                    >
+                      Back to password login
+                    </Button>
                   </div>
-
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-3 text-gray-400" />
-                    <Input
-                      className="pl-10 bg-white/10 border-white/20 text-white"
-                      type="password"
-                      placeholder="Password"
-                      value={loginData.password}
-                      onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
-                      required
-                    />
-                  </div>
-
-                  <Button className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5 shadow-lg shadow-purple-500/30">
-                    {loading ? "Logging in..." : "Login"}
-                  </Button>
-                </form>
+                )}
               </TabsContent>
 
               {/* REGISTER */}
@@ -241,9 +407,33 @@ export default function AuthPage() {
                   </div>
 
 
-                <Button type="submit" className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5 shadow-lg shadow-purple-500/30">
+                <Button type="submit" disabled={loading} className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5 shadow-lg shadow-purple-500/30">
                   {loading ? "Creating account..." : "Create Account"}
                 </Button>
+
+                {GOOGLE_OAUTH_ENABLED && (
+                  <>
+                    <div className="relative my-4">
+                      <div className="absolute inset-0 flex items-center">
+                        <span className="w-full border-t border-white/20" />
+                      </div>
+                      <div className="relative flex justify-center text-xs uppercase">
+                        <span className="bg-black px-2 text-gray-400">Or sign up with</span>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-center">
+                      <GoogleLogin
+                        onSuccess={handleGoogleSuccess}
+                        onError={handleGoogleError}
+                        theme="filled_black"
+                        size="large"
+                        text="signup_with"
+                        shape="rectangular"
+                      />
+                    </div>
+                  </>
+                )}
               </form>
             </TabsContent>
           </Tabs>
@@ -251,10 +441,16 @@ export default function AuthPage() {
       </Card>
 
       <p className="text-center text-sm text-gray-400 mt-4">
-        Mock OTP is: <span className="font-semibold text-purple-300">123456</span>
+        OTP will be sent to your email (or logged in console for testing)
       </p>
     </motion.div>
   </div>
   );
+
+  return GOOGLE_OAUTH_ENABLED ? (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      {content}
+    </GoogleOAuthProvider>
+  ) : content;
 }
 

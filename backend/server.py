@@ -20,6 +20,12 @@ import os
 import certifi
 import re
 import json
+import pyotp
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 # ================= CONFIG =====================
 ROOT_DIR = Path(__file__).parent
@@ -30,6 +36,16 @@ DB_NAME = os.getenv("DB_NAME", "oops_db")
 SECRET_KEY = os.getenv("JWT_SECRET", "secret")
 ALGO = "HS256"
 TOKEN_EXP = 60 * 24 * 7  # minutes
+
+# OTP & OAuth Config
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "5"))
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
@@ -100,6 +116,17 @@ class Token(BaseModel):
     token_type: str = "bearer"
     user: User
 
+class OTPRequest(BaseModel):
+    email: EmailStr
+    purpose: str = "login"  # "login" or "register"
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    otp: str
+
+class GoogleAuthRequest(BaseModel):
+    token: str  # Google ID token
+
 # ================ HELPERS ===========================
 def hash_pw(pwd: str) -> str:
     return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
@@ -126,6 +153,71 @@ def safe_int(x, default=0):
 
 def regex_icase(s: str):
     return {"$regex": re.escape(s), "$options": "i"}
+
+# OTP Helper Functions
+def generate_otp() -> str:
+    """Generate a 6-digit OTP"""
+    return pyotp.random_base32()[:6].upper()
+
+async def send_otp_email(email: str, otp: str):
+    """Send OTP via email"""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        logger.warning("SMTP not configured, OTP will only be logged")
+        logger.info(f"📧 OTP for {email}: {otp}")
+        return
+    
+    try:
+        message = MIMEMultipart()
+        message["From"] = SMTP_USER
+        message["To"] = email
+        message["Subject"] = "Your LiveMART OTP Code"
+        
+        body = f"""
+        <html>
+            <body>
+                <h2>LiveMART Verification</h2>
+                <p>Your OTP code is: <strong style="font-size: 24px; color: #7C3AED;">{otp}</strong></p>
+                <p>This code will expire in {OTP_EXPIRY_MINUTES} minutes.</p>
+                <p>If you didn't request this code, please ignore this email.</p>
+            </body>
+        </html>
+        """
+        message.attach(MIMEText(body, "html"))
+        
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_HOST,
+            port=SMTP_PORT,
+            username=SMTP_USER,
+            password=SMTP_PASSWORD,
+            start_tls=True,
+        )
+        logger.info(f"✅ OTP sent to {email}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send OTP email: {e}")
+        logger.info(f"📧 OTP for {email}: {otp}")  # Log OTP as fallback
+
+async def verify_google_token(token: str) -> dict:
+    """Verify Google ID token and return user info"""
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+        
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise ValueError('Wrong issuer.')
+        
+        return {
+            'email': idinfo['email'],
+            'name': idinfo.get('name', ''),
+            'google_id': idinfo['sub'],
+            'picture': idinfo.get('picture', '')
+        }
+    except Exception as e:
+        logger.error(f"❌ Google token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")
 
 # ================== AUTH ============================
 @api.post("/auth/register", response_model=Token)
@@ -184,6 +276,165 @@ async def login(data: UserLogin):
 
     token = create_token({"sub": user.email, "user_id": user.id})
     return Token(access_token=token, user=user)
+
+# ================= OTP ENDPOINTS ====================
+@api.post("/auth/otp/send")
+async def send_otp(data: OTPRequest):
+    """Send OTP to user's email"""
+    try:
+        # Check if user exists (for login) or doesn't exist (for register)
+        user = await db.users.find_one({"email": data.email})
+        
+        if data.purpose == "login" and not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if data.purpose == "register" and user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # Generate OTP
+        otp = generate_otp()
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+        
+        # Store OTP in database
+        await db.otps.update_one(
+            {"email": data.email},
+            {
+                "$set": {
+                    "otp": otp,
+                    "expiry": expiry,
+                    "purpose": data.purpose,
+                    "created_at": datetime.now(timezone.utc)
+                }
+            },
+            upsert=True
+        )
+        
+        # Send OTP via email
+        await send_otp_email(data.email, otp)
+        
+        return {
+            "message": "OTP sent successfully",
+            "email": data.email,
+            "expires_in_minutes": OTP_EXPIRY_MINUTES
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Send OTP error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send OTP")
+
+@api.post("/auth/otp/verify")
+async def verify_otp(data: OTPVerify):
+    """Verify OTP and return session token"""
+    try:
+        # Find OTP record
+        otp_record = await db.otps.find_one({"email": data.email})
+        
+        if not otp_record:
+            raise HTTPException(status_code=400, detail="No OTP found for this email")
+        
+        # Check if OTP is expired - handle both aware and naive datetimes
+        expiry = otp_record["expiry"]
+        if isinstance(expiry, datetime):
+            # If stored datetime is naive, make it aware
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+        
+        if datetime.now(timezone.utc) > expiry:
+            await db.otps.delete_one({"email": data.email})
+            raise HTTPException(status_code=400, detail="OTP expired")
+        
+        # Verify OTP
+        if otp_record["otp"] != data.otp.upper():
+            raise HTTPException(status_code=400, detail="Invalid OTP")
+        
+        # OTP is valid, delete it
+        await db.otps.delete_one({"email": data.email})
+        
+        # For login purpose, return user token
+        if otp_record["purpose"] == "login":
+            user_doc = await db.users.find_one({"email": data.email})
+            if not user_doc:
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            user_doc.pop("password", None)
+            user = User(**user_doc)
+            token = create_token({"sub": user.email, "user_id": user.id})
+            return Token(access_token=token, user=user)
+        
+        # For register purpose, return success (user still needs to complete registration)
+        return {
+            "message": "OTP verified successfully",
+            "email": data.email,
+            "verified": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Verify OTP error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to verify OTP")
+
+# ================= GOOGLE OAUTH ENDPOINTS ====================
+@api.post("/auth/google", response_model=Token)
+async def google_auth(data: GoogleAuthRequest):
+    """Authenticate user with Google OAuth"""
+    try:
+        # Verify Google token
+        google_user = await verify_google_token(data.token)
+        
+        # Check if user exists
+        user_doc = await db.users.find_one({"email": google_user["email"]})
+        
+        if user_doc:
+            # Existing user - login
+            user_doc.pop("password", None)
+            
+            # Check retailer matching for customers
+            if user_doc.get("role") == "customer" and user_doc.get("pincode") and not user_doc.get("preferred_retailer_id"):
+                matching_retailer = await db.users.find_one({
+                    "role": "retailer",
+                    "pincode": user_doc.get("pincode")
+                })
+                if matching_retailer:
+                    user_doc["preferred_retailer_id"] = matching_retailer["id"]
+                    await db.users.update_one(
+                        {"id": user_doc["id"]},
+                        {"$set": {"preferred_retailer_id": matching_retailer["id"]}}
+                    )
+            
+            user = User(**user_doc)
+        else:
+            # New user - register
+            user_dict = {
+                "id": str(uuid.uuid4()),
+                "email": google_user["email"],
+                "name": google_user["name"],
+                "phone": "",  # Can be updated later
+                "role": "customer",  # Default role
+                "address": "",
+                "pincode": None,
+                "preferred_retailer_id": None,
+                "created_at": datetime.now(timezone.utc)
+            }
+            
+            user = User(**user_dict)
+            doc = user.model_dump()
+            doc["password"] = hash_pw(str(uuid.uuid4()))  # Random password for OAuth users
+            doc["google_id"] = google_user.get("google_id")
+            doc["picture"] = google_user.get("picture")
+            
+            await db.users.insert_one(doc)
+            logger.info(f"✅ New user registered via Google: {user.email}")
+        
+        token = create_token({"sub": user.email, "user_id": user.id})
+        return Token(access_token=token, user=user)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Google auth error: {e}")
+        raise HTTPException(status_code=500, detail="Google authentication failed")
 
 # ================= USER/RETAILER ENDPOINTS ====================
 @api.get("/retailers/by-pincode/{pincode}")
