@@ -56,8 +56,8 @@ const CustomerDashboard = () => {
   // ❗ CUSTOMER ID (not retailer)
   const CUSTOMER_ID = user?.id;
 
-  // ❗ Retailer from which customer buys — DO NOT use customer ID here
-  const RETAILER_ID = "9b155690-f6b4-4119-b3d0-4f4e8d717e18";
+  // ❗ Retailer from which customer buys — Use preferred_retailer_id from user profile or fallback
+  const RETAILER_ID = user?.preferred_retailer_id || "9b155690-f6b4-4119-b3d0-4f4e8d717e18";
 
   const [categories, setCategories] = useState([]);
   const [products, setProducts] = useState([]);

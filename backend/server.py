@@ -84,6 +84,8 @@ class User(BaseModel):
     phone: str
     role: str
     address: Optional[str] = None
+    pincode: Optional[str] = None
+    preferred_retailer_id: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(User):
@@ -135,6 +137,17 @@ async def register(data: UserCreate):
     hashed = hash_pw(data.password)
     user_dict = data.model_dump()
     user_dict.pop("password", None)
+    
+    # If user is a customer with pincode, find matching retailer
+    if data.role == "customer" and data.pincode:
+        matching_retailer = await db.users.find_one({
+            "role": "retailer",
+            "pincode": data.pincode
+        })
+        if matching_retailer:
+            user_dict["preferred_retailer_id"] = matching_retailer["id"]
+            logger.info(f"Matched customer to retailer {matching_retailer['id']} by pincode {data.pincode}")
+    
     user = User(**user_dict)
 
     doc = user.model_dump()
@@ -152,10 +165,58 @@ async def login(data: UserLogin):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_doc.pop("password", None)
+    
+    # Check if customer needs retailer matching based on pincode
+    if user_doc.get("role") == "customer" and user_doc.get("pincode") and not user_doc.get("preferred_retailer_id"):
+        matching_retailer = await db.users.find_one({
+            "role": "retailer",
+            "pincode": user_doc.get("pincode")
+        })
+        if matching_retailer:
+            user_doc["preferred_retailer_id"] = matching_retailer["id"]
+            await db.users.update_one(
+                {"id": user_doc["id"]},
+                {"$set": {"preferred_retailer_id": matching_retailer["id"]}}
+            )
+            logger.info(f"Matched customer {user_doc['id']} to retailer {matching_retailer['id']} by pincode")
+    
     user = User(**user_doc)
 
     token = create_token({"sub": user.email, "user_id": user.id})
     return Token(access_token=token, user=user)
+
+# ================= USER/RETAILER ENDPOINTS ====================
+@api.get("/retailers/by-pincode/{pincode}")
+async def get_retailers_by_pincode(pincode: str):
+    """Get all retailers with matching pincode"""
+    retailers = await db.users.find(
+        {"role": "retailer", "pincode": pincode},
+        {"_id": 0, "password": 0}
+    ).to_list(100)
+    return retailers
+
+@api.put("/users/{user_id}/preferred-retailer")
+async def update_preferred_retailer(user_id: str, payload: dict = Body(...)):
+    """Update customer's preferred retailer"""
+    retailer_id = payload.get("retailer_id")
+    if not retailer_id:
+        raise HTTPException(400, "retailer_id is required")
+    
+    # Verify retailer exists
+    retailer = await db.users.find_one({"id": retailer_id, "role": "retailer"})
+    if not retailer:
+        raise HTTPException(404, "Retailer not found")
+    
+    # Update user
+    result = await db.users.update_one(
+        {"id": user_id},
+        {"$set": {"preferred_retailer_id": retailer_id}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(404, "User not found")
+    
+    return {"message": "Preferred retailer updated", "retailer_id": retailer_id}
 
 # ============== HEALTH CHECK =========================
 @api.get("/health")
@@ -276,8 +337,9 @@ async def get_product_feedback(product_id: str):
 @api.post("/seed-data")
 async def seed_data():
     wholesalers = [
-        {"id": "wh1", "name": "Wholesaler One", "role": "wholesaler", "email": "wh1@example.com", "phone": "000", "password": hash_pw("password")},
-        {"id": "ret1", "name": "Retailer One", "role": "retailer", "email": "ret1@example.com", "phone": "111", "password": hash_pw("password")},
+        {"id": "wh1", "name": "Wholesaler One", "role": "wholesaler", "email": "wh1@example.com", "phone": "000", "password": hash_pw("password"), "pincode": "110001", "address": "Wholesale Market, Delhi"},
+        {"id": "ret1", "name": "Retailer One", "role": "retailer", "email": "ret1@example.com", "phone": "111", "password": hash_pw("password"), "pincode": "110001", "address": "Retail Store, Delhi"},
+        {"id": "9b155690-f6b4-4119-b3d0-4f4e8d717e18", "name": "Default Retailer", "role": "retailer", "email": "retailer@default.com", "phone": "222", "password": hash_pw("password"), "pincode": "400001", "address": "Default Store, Mumbai"},
     ]
 
     categories = [

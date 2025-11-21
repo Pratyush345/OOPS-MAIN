@@ -25,6 +25,7 @@ export default function AuthPage() {
     phone: "",
     role: "customer",
     address: "",
+    pincode: "",
   });
 
   const handleLogin = async (e) => {
@@ -224,6 +225,20 @@ export default function AuthPage() {
     required
   />
 </div>
+
+                  <div>
+                    <Label>Pincode</Label>
+                    <Input
+                      className="bg-white/10 border-white/20 text-white"
+                      type="text"
+                      placeholder="Enter your pincode"
+                      value={registerData.pincode}
+                      onChange={(e) =>
+                        setRegisterData({ ...registerData, pincode: e.target.value })
+                      }
+                      required
+                    />
+                  </div>
 
 
                 <Button type="submit" className="w-full bg-purple-600 hover:bg-purple-700 text-white rounded-xl py-5 shadow-lg shadow-purple-500/30">
